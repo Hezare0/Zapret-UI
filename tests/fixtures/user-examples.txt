@@ -1,0 +1,42 @@
+## [1/21] general (ALT).bat
+> Starting config...
+> Running tests...
+> [WARN] Runspace for target timed out after 10000 ms; stopping runspace...
+> [WARN] EndInvoke failed for a runspace; treating as failure.
+> DiscordMain              HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: Timeout
+> DiscordGateway           HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 94 ms
+> DiscordCDN               HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 95 ms
+> DiscordUpdates           HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 70 ms
+> YouTubeWeb               HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 73 ms
+> YouTubeShort             HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 54 ms
+> YouTubeImage             HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 87 ms
+> YouTubeVideoRedirect     HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 78 ms
+> GoogleMain               HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 47 ms
+> GoogleGstatic            HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 59 ms
+> CloudflareCDN            HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 56 ms
+> CloudflareDNS1111        Ping: 48 ms
+> CloudflareDNS1001        Ping: 47 ms
+> GoogleDNS8888            Ping: 51 ms
+> GoogleDNS8844            Ping: 45 ms
+> Quad9DNS9999             Ping: 56 ms
+
+## [3/21] general (ALT3).bat
+> Starting config...
+> Running tests...
+> DiscordMain              HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 71 ms
+> DiscordGateway           HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 69 ms
+> DiscordCDN               HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 75 ms
+> DiscordUpdates           HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 72 ms
+> YouTubeWeb               HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 70 ms
+> YouTubeShort             HTTP:ERROR TLS1.2:OK    TLS1.3:ERROR | Ping: 43 ms
+> YouTubeImage             HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 96 ms
+> YouTubeVideoRedirect     HTTP:OK    TLS1.2:OK    TLS1.3:OK    | Ping: 75 ms
+> GoogleMain               HTTP:ERROR TLS1.2:OK    TLS1.3:ERROR | Ping: 47 ms
+> GoogleGstatic            HTTP:ERROR TLS1.2:OK    TLS1.3:ERROR | Ping: 56 ms
+> CloudflareWeb            HTTP:UNSUP TLS1.2:UNSUP TLS1.3:UNSUP | Ping: 72 ms
+> CloudflareCDN            HTTP:ERROR TLS1.2:OK    TLS1.3:ERROR | Ping: 55 ms
+> CloudflareDNS1111        Ping: 46 ms
+> CloudflareDNS1001        Ping: 28 ms
+> GoogleDNS8888            Ping: 52 ms
+> GoogleDNS8844            Ping: 45 ms
+> Quad9DNS9999             Ping: 55 ms
