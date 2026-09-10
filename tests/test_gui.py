@@ -1,5 +1,6 @@
 from pathlib import Path
 import time
+import threading
 
 from PySide6.QtCore import Qt
 
@@ -7,6 +8,7 @@ from zapret_client.gui import MainWindow
 from zapret_client.results import ReportParser
 from zapret_client.storage import Store
 from zapret_client.updates import UpdateInfo
+from zapret_client.controller import TestOutcome
 
 
 EXAMPLES = Path(__file__).parent / "fixtures/user-examples.txt"
@@ -118,4 +120,80 @@ def test_stale_and_incomplete_results_are_not_green(app, sample_repo, tmp_path):
     (sample_repo / name).write_text("echo changed")
     window.refresh_repository()
     assert window.config_table.item(row, 1).text() == "Устарел"
+    window.close()
+
+
+def drain_until(app, condition, seconds=3):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert condition()
+
+
+def install_cancellable_fixture(window, tmp_path, monkeypatch, cleanup_ok=True):
+    started = threading.Event()
+    def run(repo, progress, control):
+        started.set()
+        assert control.cancel.wait(3), "Cancellation signal was not delivered"
+        return TestOutcome(ReportParser(), tmp_path / "cancel.log", {}, False, "Проверка остановлена", True, cleanup_ok)
+    monkeypatch.setattr(window.controller, "run_tests", run)
+    return started
+
+
+def test_stop_button_cancels_sweep_and_keeps_window_open(app, sample_repo, tmp_path, monkeypatch):
+    window = MainWindow(Store(tmp_path / "state"), sample_repo)
+    window.show()
+    started = install_cancellable_fixture(window, tmp_path, monkeypatch)
+    window.start_tests()
+    drain_until(app, started.is_set)
+    assert window.stop_button.isEnabled()
+    assert window.stop_button.text() == "Остановить проверку"
+    window.stop_button.click()
+    assert window.test_control.cancel.is_set()
+    assert not window.stop_button.isEnabled()
+    drain_until(app, lambda: window.worker is None)
+    assert window.isVisible()
+    window.close()
+
+
+def test_close_during_sweep_cancels_then_closes_automatically(app, sample_repo, tmp_path, monkeypatch):
+    window = MainWindow(Store(tmp_path / "state"), sample_repo)
+    window.show()
+    started = install_cancellable_fixture(window, tmp_path, monkeypatch)
+    window.start_tests()
+    drain_until(app, started.is_set)
+    window.close()
+    assert window.test_control.cancel.is_set() and window.test_control.closing.is_set()
+    drain_until(app, lambda: window.worker is None and not window.isVisible())
+
+
+def test_close_does_not_hide_cleanup_failure(app, sample_repo, tmp_path, monkeypatch):
+    window = MainWindow(Store(tmp_path / "state"), sample_repo)
+    window.show()
+    started = install_cancellable_fixture(window, tmp_path, monkeypatch, cleanup_ok=False)
+    window.start_tests()
+    drain_until(app, started.is_set)
+    window.close()
+    drain_until(app, lambda: window.worker is None)
+    assert window.isVisible() and not window.close_requested
+    window.close()
+
+
+def test_close_is_queued_for_non_test_operation(app, sample_repo, tmp_path):
+    window = MainWindow(Store(tmp_path / "state"), sample_repo)
+    window.show()
+    window.begin("fixture", lambda progress: time.sleep(0.15))
+    window.close()
+    assert window.close_requested
+    drain_until(app, lambda: window.worker is None and not window.isVisible())
+
+
+def test_completed_live_config_keeps_checkpoint_date(app, sample_repo, tmp_path):
+    window = MainWindow(Store(tmp_path / "state"), sample_repo)
+    result = ReportParser.parse(EXAMPLES.read_text()).results["general (alt).bat"]
+    window.store.put(window.repo.key, result, "", "checkpoint", tested_at="2026-09-10T21:47:14+05:00")
+    window.live_results[result.config.casefold()] = result
+    window.rebuild_table()
+    assert window.config_table.item(0, 4).text() == "10.09 21:47"
     window.close()

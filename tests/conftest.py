@@ -26,4 +26,11 @@ def sample_repo(tmp_path):
 @pytest.fixture(scope="session")
 def app():
     from zapret_client.gui import create_application
-    return create_application(["zapret-client-tests"])
+    from PySide6.QtGui import QFontDatabase
+    application = create_application(["zapret-client-tests"])
+    application.setQuitOnLastWindowClosed(False)
+    for name in ("segoeui.ttf", "segoeuib.ttf", "consola.ttf"):
+        font = Path(os.environ["SystemRoot"]) / "Fonts" / name
+        if font.is_file():
+            QFontDatabase.addApplicationFont(str(font))
+    return application

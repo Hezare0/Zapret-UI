@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from build_support.policy import clean_build_environment, validate_binary_origins
+from build_support.vendor import MINGIT_VERSION, prepare_mingit
 
 
 @pytest.mark.parametrize("root_key", ["SystemRoot", "SYSTEMROOT"])
@@ -33,3 +34,12 @@ def test_shadowing_windows_icu_is_rejected_even_from_allowed_root(tmp_path):
 def test_expected_package_binary_is_audited(tmp_path):
     records = validate_binary_origins([("PySide6/Qt6Core.dll", str(tmp_path / "Qt6Core.dll"), "BINARY")], (tmp_path,))
     assert records[0]["destination"] == "PySide6/Qt6Core.dll"
+
+
+def test_unverified_mingit_is_never_extracted(tmp_path):
+    archive = tmp_path / f"MinGit-{MINGIT_VERSION}-64-bit.zip"
+    archive.write_bytes(b"wrong download")
+    target = tmp_path / "runtime"
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        prepare_mingit(tmp_path, target)
+    assert not target.exists()

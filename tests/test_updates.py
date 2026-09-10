@@ -121,3 +121,11 @@ def test_external_timeout_stops_descendants(tmp_path):
         process.wait(timeout=2)
     except psutil.NoSuchProcess:
         pass
+
+
+def test_bundled_git_is_used_before_system_git(tmp_path, monkeypatch):
+    executable = tmp_path / "vendor/git/cmd/git.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert find_git() == str(executable)

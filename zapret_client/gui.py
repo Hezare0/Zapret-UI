@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .controller import Controller, TestOutcome
+from .controller import Controller, TestControl, TestOutcome
 from .repository import ClientError, Repository
 from .results import ReportParser, Result
 from .storage import Store
@@ -138,6 +138,8 @@ class MainWindow(QMainWindow):
         self.last_log: Path | None = None
         self.loaded_log = ""
         self.update_info: UpdateInfo | None = None
+        self.test_control: TestControl | None = None
+        self.close_requested = False
         self.preview = preview
         self.setWindowTitle(f"Zapret Client · {__version__}" + (" · ТЕСТОВЫЕ ДАННЫЕ" if preview else ""))
         self.resize(1320, 930)
@@ -349,7 +351,9 @@ class MainWindow(QMainWindow):
         key = name.casefold()
         entry = self.store.entries(self.repo.key).get(key)
         if key in self.live_results:
-            return self.live_results[key], {"source": "running", "tested_at": "", "fingerprint": ""}
+            result = self.live_results[key]
+            return result, {"source": "running", "tested_at": entry.get("tested_at", "") if entry and result.complete else "",
+                            "fingerprint": ""}
         if entry:
             try:
                 return Result.from_dict(entry["result"]), entry
@@ -375,6 +379,8 @@ class MainWindow(QMainWindow):
             return "Прогон прерван", AMBER
         if result.launch_failed:
             return "Ошибка запуска", RED
+        if entry["source"] == "cancelled" and not result.complete:
+            return "Проверка отменена", AMBER
         if entry["source"] == "incomplete" or not result.complete or len(result.targets) < result.total:
             return "Неполный вывод", AMBER
         if result.total and result.passed == result.total:
@@ -463,6 +469,8 @@ class MainWindow(QMainWindow):
                 note = "Импортированный отчёт: дата исходного теста и соответствие текущим файлам не подтверждены.\n" + note
             elif entry["source"] in ("incomplete", "checkpoint") or not result.complete:
                 note = "Прогон не завершён — результат предварительный.\n" + note
+            elif entry["source"] == "cancelled":
+                note = "Общий прогон остановлен. Этот результат получен до отмены.\n" + note
             elif entry["source"] != "running" and entry.get("fingerprint") != self.repo.get(name).fingerprint:
                 note = "Файлы изменились после теста. Запусти проверку заново.\n" + note
             self.detail_note.setText(note)
@@ -502,7 +510,9 @@ class MainWindow(QMainWindow):
     def update_controls(self):
         busy = self.worker is not None
         has_repo = self.repo is not None
-        active = self.controller.active_name is not None
+        active = self.controller.active_name is not None or self.controller.cleanup_pending
+        testing = busy and self.operation == "tests"
+        cancelling = testing and self.test_control is not None and self.test_control.cancel.is_set()
         self.folder_button.setEnabled(not busy and not active)
         self.refresh_button.setEnabled(not busy and has_repo)
         self.test_button.setEnabled(not busy and has_repo and not self.preview)
@@ -514,7 +524,8 @@ class MainWindow(QMainWindow):
                                            "Создать резервную копию и применить проверенный commit через fast-forward.")
         self.import_button.setEnabled(not busy and has_repo)
         self.start_button.setEnabled(not busy and bool(self.selected_name()) and not self.preview)
-        self.stop_button.setEnabled(not busy and active)
+        self.stop_button.setText("Остановка…" if cancelling else ("Остановить проверку" if testing else "Остановить"))
+        self.stop_button.setEnabled((testing and not cancelling) or (not busy and active))
         self.admin_button.setText("● Администратор" if is_admin() else "Права администратора")
         self.admin_button.setEnabled(not busy and not active and not is_admin() and not self.preview)
         self.open_log_button.setEnabled(bool(self.last_log and self.last_log.is_file()))
@@ -550,10 +561,10 @@ class MainWindow(QMainWindow):
             return
         self.operation = kind
         self.worker = Worker(operation, self)
-        self.worker.succeeded.connect(self.operation_succeeded)
-        self.worker.failed.connect(self.show_error)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.finished.connect(self.operation_finished)
+        self.worker.succeeded.connect(self.operation_succeeded, Qt.ConnectionType.QueuedConnection)
+        self.worker.failed.connect(self.show_error, Qt.ConnectionType.QueuedConnection)
+        self.worker.progress.connect(self.on_progress, Qt.ConnectionType.QueuedConnection)
+        self.worker.finished.connect(self.operation_finished, Qt.ConnectionType.QueuedConnection)
         self.progress.setRange(0, 0)
         self.update_controls()
         self.worker.start()
@@ -565,8 +576,19 @@ class MainWindow(QMainWindow):
             self.begin("start", lambda progress: self.controller.start(self.repo, name))
 
     def stop_active(self):
+        if self.operation == "tests" and self.worker:
+            self.cancel_tests()
+            return
         self.status.setText("Останавливаю процессы выбранной конфигурации…")
         self.begin("stop", lambda progress: self.controller.stop())
+
+    def cancel_tests(self, *, closing=False):
+        if self.test_control:
+            self.test_control.request(closing=closing)
+        self.status.setText("Останавливаю проверку, сохраняю результаты и завершаю очистку…" +
+                            (" Затем приложение закроется." if closing else ""))
+        self.progress.setRange(0, 0)
+        self.update_controls()
 
     def start_tests(self):
         if not self.repo:
@@ -574,23 +596,28 @@ class MainWindow(QMainWindow):
         self.live_results.clear()
         self.test_current = None
         self.log.clear()
-        self.status.setText("Проверка всех конфигураций. Окно можно свернуть; закрытие доступно после восстановления состояния.")
-        self.begin("tests", lambda progress: self.controller.run_tests(self.repo, progress))
+        self.test_control = TestControl()
+        control = self.test_control
+        self.status.setText("Проверка всех конфигураций. Её можно остановить кнопкой или закрытием окна.")
+        self.begin("tests", lambda progress: self.controller.run_tests(self.repo, progress, control))
         self.rebuild_table()
 
+    @Slot(str, object)
     def on_progress(self, line, snapshot):
         self.log.appendPlainText(line)
         if self.operation != "tests":
-            self.status.setText(line)
+            if not self.close_requested:
+                self.status.setText(line)
             return
         self.live_results = {key: Result.from_dict(value) for key, value in snapshot["results"].items()}
         self.test_current = snapshot["current"]
-        if snapshot["count"]:
+        if snapshot["count"] and not (self.test_control and self.test_control.cancel.is_set()):
             self.progress.setRange(0, snapshot["count"])
             self.progress.setValue(max(0, snapshot["index"] - 1))
             self.status.setText(f"Проверка {snapshot['index']}/{snapshot['count']} · {self.test_current or 'восстановление состояния'}")
         self.rebuild_table()
 
+    @Slot(object)
     def operation_succeeded(self, value):
         try:
             if isinstance(value, UpdateInfo):
@@ -609,14 +636,8 @@ class MainWindow(QMainWindow):
                 self.log.appendPlainText(value.message)
             elif isinstance(value, TestOutcome):
                 self.last_log = value.log
-                for result in value.parser.results.values():
-                    if result.config.casefold() not in value.fingerprints:
-                        continue
-                    checkpoint = self.store.entries(self.repo.key).get(result.config.casefold(), {})
-                    self.store.put(self.repo.key, result, value.fingerprints[result.config.casefold()],
-                                   "live" if value.successful else "incomplete", str(value.log),
-                                   tested_at=checkpoint.get("tested_at") if checkpoint.get("source") == "checkpoint" else None)
-                self.store.save()
+                if not value.cleanup_ok:
+                    self.close_requested = False
                 self.status.setText(value.message)
                 self.log.appendPlainText("[CLIENT] " + value.message)
                 if not value.successful:
@@ -625,19 +646,25 @@ class MainWindow(QMainWindow):
             elif self.operation == "start":
                 self.last_log = self.controller.last_log
                 self.status.setText(f"Работает {value}. Процесс winws.exe запущен и проверен.")
-            elif self.operation == "stop":
+            elif self.operation in ("stop", "close_stop"):
                 self.status.setText("Конфигурация остановлена.")
         except Exception as exc:
             self.show_error(f"Результат получен, но не удалось сохранить кэш: {exc}")
 
+    @Slot()
     def operation_finished(self):
         worker = self.worker
+        if worker:
+            # finished can arrive while native thread-local teardown is still
+            # running. Join before allowing the window to destroy its children.
+            worker.wait()
         if self.operation == "apply_update":
             self.update_info = None
         self.worker = None
         self.operation = ""
         self.live_results.clear()
         self.test_current = None
+        self.test_control = None
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         if self.repo:
@@ -647,7 +674,12 @@ class MainWindow(QMainWindow):
                 self.show_error(str(exc))
         self.rebuild_table()
         if worker:
-            worker.deleteLater()
+            # Release only after join, without a deferred QObject destruction
+            # event surviving into the next operation.
+            worker.operation = None
+            worker.setParent(None)
+        if self.close_requested:
+            QTimer.singleShot(0, self.close)
 
     def import_text(self, text: str, source: Path | None = None) -> int:
         if not self.repo:
@@ -680,7 +712,9 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.show_error(str(exc))
 
+    @Slot(str)
     def show_error(self, text):
+        self.close_requested = False
         self.status.setText(text.split("\n")[0])
         self.log.appendPlainText("[CLIENT ERROR] " + text)
         QMessageBox.warning(self, "Не удалось выполнить действие", text)
@@ -706,23 +740,28 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.worker:
-            self.status.setText("Дождись завершения операции: клиент должен восстановить состояние и сохранить результаты.")
+            self.close_requested = True
+            if self.operation == "tests":
+                self.cancel_tests(closing=True)
+            else:
+                self.status.setText("Закрываю приложение после завершения текущей операции…")
             event.ignore()
             return
-        if self.controller.active_name:
-            answer = QMessageBox.question(self, "Завершить работу?",
+        if self.controller.active_name or self.controller.cleanup_pending:
+            answer = QMessageBox.StandardButton.Yes
+            if not self.close_requested:
+                answer = QMessageBox.question(self, "Завершить работу?",
                                           "При закрытии клиента запущенная им конфигурация будет остановлена.",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                           QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            try:
-                self.controller.stop()
-            except Exception as exc:
-                self.show_error(str(exc))
-                event.ignore()
-                return
+            self.close_requested = True
+            self.status.setText("Останавливаю процессы перед закрытием…")
+            self.begin("close_stop", lambda progress: self.controller.stop())
+            event.ignore()
+            return
         self.timer.stop()
         event.accept()
 

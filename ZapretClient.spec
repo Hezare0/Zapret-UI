@@ -25,17 +25,18 @@ Path(os.environ['ZAPRET_BUILD_AUDIT']).write_text(
     json.dumps(audit, indent=2), encoding='utf-8')
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
+vendor_root = Path(os.environ['ZAPRET_MINGIT_ROOT'])
+# MinGit is a separate, hash-verified portable runtime. Preserve its own layout
+# after Python/Qt analysis so its DLLs cannot shadow the application's DLLs.
+a.datas += [(str(Path('vendor/git') / p.relative_to(vendor_root)), str(p), 'DATA')
+            for p in vendor_root.rglob('*') if p.is_file()]
+options = dict(
     name='ZapretClient',
     icon=str(Path(SPECPATH) / 'assets' / 'zapret-client.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -44,12 +45,8 @@ exe = EXE(
     entitlements_file=None,
     uac_admin=True,
 )
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='ZapretClient',
-)
+if os.environ.get('ZAPRET_ONEFILE') == '1':
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], **options)
+else:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, **options)
+    coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='ZapretClient')

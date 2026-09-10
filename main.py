@@ -12,17 +12,20 @@ def main():
     parser.add_argument("--admin", action="store_true", help="Request elevation once at startup")
     parser.add_argument("--smoke-test", type=Path, metavar="REPORT_JSON",
                         help="Check packaged GUI startup and exit; never run BAT files")
+    parser.add_argument("--smoke-cancel", type=Path, metavar="REPORT_JSON",
+                        help="Check cancel/close with a harmless sleep process; requires --repo")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This client requires Windows 10/11")
-    if args.smoke_test:
+    report = args.smoke_test or args.smoke_cancel
+    if report:
         try:
             return run(args)
         except Exception:
             import json
             import traceback
-            args.smoke_test.parent.mkdir(parents=True, exist_ok=True)
-            args.smoke_test.write_text(json.dumps({"ok": False, "traceback": traceback.format_exc()},
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps({"ok": False, "traceback": traceback.format_exc()},
                                                  ensure_ascii=False, indent=2), encoding="utf-8")
             return 1
     return run(args)
@@ -38,6 +41,9 @@ def run(args):
     if args.smoke_test:
         from zapret_client.smoke import run_smoke
         return run_smoke(app, args.repo, args.smoke_test)
+    if args.smoke_cancel:
+        from zapret_client.smoke import run_cancel_smoke
+        return run_cancel_smoke(app, args.repo, args.smoke_cancel)
     if args.admin and not is_admin():
         try:
             elevate(sys.argv[1:])
@@ -54,9 +60,11 @@ def run(args):
         store = Store()
         repo = args.repo
         if not repo and not store.data.get("last_repository") and getattr(sys, "frozen", False):
-            adjacent = Path(sys.executable).resolve().parent.parent / "zapret-discord-youtube"
-            if (adjacent / "service.bat").is_file():
-                repo = adjacent
+            location = Path(sys.executable).resolve().parent
+            for adjacent in (location / "zapret-discord-youtube", location.parent / "zapret-discord-youtube"):
+                if (adjacent / "service.bat").is_file():
+                    repo = adjacent
+                    break
         window = MainWindow(store, repo)
         window.show()
         return app.exec()

@@ -34,6 +34,9 @@ def is_official_remote(url: str) -> bool:
 
 
 def find_git() -> str:
+    bundled = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])) / "vendor/git/cmd/git.exe"
+    if bundled.is_file():
+        return str(bundled)
     found = shutil.which("git.exe") or shutil.which("git")
     if found:
         return found
