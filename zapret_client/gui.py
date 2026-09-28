@@ -3,6 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 import sys
+import threading
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
@@ -17,6 +18,8 @@ from .controller import Controller, TestControl, TestOutcome
 from .repository import ClientError, Repository
 from .results import ReportParser, Result
 from .storage import Store
+from .downloads import DownloadOutcome, download_directory, download_zapret
+from .self_update import UiDownloadCancelled, UiUpdateInfo, UiUpdateReady, check_ui_update, download_ui_update, launch_install_helper
 from .updates import Updater, UpdateInfo, UpdateOutcome
 from .windows import elevate, is_admin
 
@@ -139,6 +142,10 @@ class MainWindow(QMainWindow):
         self.loaded_log = ""
         self.update_info: UpdateInfo | None = None
         self.test_control: TestControl | None = None
+        self.download_control = None
+        self.ui_download_control = None
+        self.ui_update_info: UiUpdateInfo | None = None
+        self.ui_update_ready: UiUpdateReady | None = None
         self.close_requested = False
         self.preview = preview
         self.setWindowTitle(f"Zapret Client · {__version__}" + (" · ТЕСТОВЫЕ ДАННЫЕ" if preview else ""))
@@ -185,8 +192,10 @@ class MainWindow(QMainWindow):
         self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.source_label, 1)
         self.folder_button = button("Выбрать папку", self.choose_repository)
+        self.download_button = button("Скачать zapret", self.download_repository)
         self.refresh_button = button("Обновить список", self.refresh_repository, "quiet")
         row.addWidget(self.folder_button)
+        row.addWidget(self.download_button)
         row.addWidget(self.refresh_button)
         layout.addWidget(source)
 
@@ -207,6 +216,19 @@ class MainWindow(QMainWindow):
         self.update_note.setVisible(False)
         update_layout.addWidget(self.update_note)
         layout.addWidget(update_box)
+
+        client_box = QFrame()
+        client_box.setObjectName("source")
+        client_row = QHBoxLayout(client_box)
+        client_row.setContentsMargins(16, 10, 12, 10)
+        self.client_update_label = label(f"Клиент {__version__} · обновление UI не проверено", "muted", wrap=True)
+        client_row.addWidget(self.client_update_label, 1)
+        self.check_client_button = button("Проверить версию UI", self.check_client_update)
+        self.install_client_button = button("Обновить UI", self.install_client_update, "primary")
+        self.install_client_button.setVisible(False)
+        client_row.addWidget(self.check_client_button)
+        client_row.addWidget(self.install_client_button)
+        layout.addWidget(client_box)
 
         cards = QHBoxLayout()
         cards.setSpacing(12)
@@ -513,19 +535,34 @@ class MainWindow(QMainWindow):
         active = self.controller.active_name is not None or self.controller.cleanup_pending
         testing = busy and self.operation == "tests"
         cancelling = testing and self.test_control is not None and self.test_control.cancel.is_set()
+        downloading = busy and self.operation == "download"
+        download_cancelling = downloading and self.download_control is not None and self.download_control.is_set()
+        installing_ui = busy and self.operation == "install_ui"
+        ui_cancelling = installing_ui and self.ui_download_control is not None and self.ui_download_control.is_set()
         self.folder_button.setEnabled(not busy and not active)
+        self.download_button.setText("Открыть скачанный" if download_directory().is_dir() else "Скачать zapret")
+        self.download_button.setEnabled(not busy and not active and not self.preview)
         self.refresh_button.setEnabled(not busy and has_repo)
         self.test_button.setEnabled(not busy and has_repo and not self.preview)
         self.check_update_button.setEnabled(not busy and has_repo and not self.preview)
+        self.check_client_button.setEnabled(not busy and not self.preview)
+        ui_available = bool(self.ui_update_info and self.ui_update_info.has_update)
+        self.install_client_button.setVisible(ui_available)
+        self.install_client_button.setEnabled(ui_available and not busy and not active and not self.preview)
         available = bool(self.update_info and self.update_info.available)
         self.apply_update_button.setVisible(available)
         self.apply_update_button.setEnabled(available and not busy and not active and not self.preview)
         self.apply_update_button.setToolTip("Сначала останови активную конфигурацию." if active else
-                                           "Создать резервную копию и применить проверенный commit через fast-forward.")
+                                           "Сохранить изменённый IPSet и применить проверенный commit через fast-forward.")
         self.import_button.setEnabled(not busy and has_repo)
         self.start_button.setEnabled(not busy and bool(self.selected_name()) and not self.preview)
-        self.stop_button.setText("Остановка…" if cancelling else ("Остановить проверку" if testing else "Остановить"))
-        self.stop_button.setEnabled((testing and not cancelling) or (not busy and active))
+        self.stop_button.setText("Остановка…" if cancelling or download_cancelling or ui_cancelling else
+                                 ("Остановить проверку" if testing else
+                                  ("Отменить скачивание" if downloading else
+                                   ("Отменить обновление UI" if installing_ui else "Остановить"))))
+        self.stop_button.setEnabled((testing and not cancelling) or
+                                    (downloading and not download_cancelling) or
+                                    (installing_ui and not ui_cancelling) or (not busy and active))
         self.admin_button.setText("● Администратор" if is_admin() else "Права администратора")
         self.admin_button.setEnabled(not busy and not active and not is_admin() and not self.preview)
         self.open_log_button.setEnabled(bool(self.last_log and self.last_log.is_file()))
@@ -543,8 +580,38 @@ class MainWindow(QMainWindow):
         if not self.repo or not self.update_info or self.controller.active_name:
             return
         info = self.update_info
-        self.status.setText("Сохраняю резервную копию перед обновлением…")
+        self.status.setText("Проверяю локальные изменения перед обновлением…")
         self.begin("apply_update", lambda progress: Updater(self.repo, self.store).apply(info, progress))
+
+    def download_repository(self):
+        destination = download_directory()
+        if destination.exists():
+            try:
+                self.load_repository(destination)
+            except Exception as exc:
+                self.show_error(str(exc))
+            return
+        self.download_control = threading.Event()
+        control = self.download_control
+        self.status.setText(f"Скачиваю официальный zapret в {destination}…")
+        self.begin("download", lambda progress: download_zapret(destination, self.store,
+                                                                 lambda line: progress(line), control))
+
+    def check_client_update(self):
+        self.ui_update_info = None
+        self.client_update_label.setText("Проверяю GitHub Release…")
+        self.begin("check_ui", lambda progress: check_ui_update())
+
+    def install_client_update(self):
+        if not self.ui_update_info or not self.ui_update_info.has_update or self.controller.active_name:
+            return
+        info = self.ui_update_info
+        self.ui_download_control = threading.Event()
+        self.ui_update_ready = None
+        control = self.ui_download_control
+        self.status.setText(f"Скачиваю автономный UI {info.available}…")
+        self.begin("install_ui", lambda progress: download_ui_update(info, self.store,
+                                                                      lambda line: progress(line), control))
 
     def request_admin(self):
         try:
@@ -578,6 +645,16 @@ class MainWindow(QMainWindow):
     def stop_active(self):
         if self.operation == "tests" and self.worker:
             self.cancel_tests()
+            return
+        if self.operation == "download" and self.worker:
+            self.download_control.set()
+            self.status.setText("Отменяю скачивание…")
+            self.update_controls()
+            return
+        if self.operation == "install_ui" and self.worker:
+            self.ui_download_control.set()
+            self.status.setText("Отменяю скачивание UI…")
+            self.update_controls()
             return
         self.status.setText("Останавливаю процессы выбранной конфигурации…")
         self.begin("stop", lambda progress: self.controller.stop())
@@ -620,17 +697,37 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def operation_succeeded(self, value):
         try:
-            if isinstance(value, UpdateInfo):
+            if isinstance(value, UiUpdateInfo):
+                self.ui_update_info = value
+                self.client_update_label.setText(f"Доступен UI {value.available}" if value.has_update else
+                                                 f"Клиент {__version__} · установлена последняя версия")
+                self.status.setText("Готово к установке." if value.has_update else "UI уже обновлён.")
+            elif isinstance(value, UiDownloadCancelled):
+                self.status.setText(value.message)
+            elif isinstance(value, UiUpdateReady):
+                if self.ui_download_control and self.ui_download_control.is_set():
+                    value.staged_exe.unlink(missing_ok=True)
+                    self.status.setText("Обновление UI отменено.")
+                else:
+                    self.ui_update_ready = value
+                    self.status.setText(value.message)
+            elif isinstance(value, DownloadOutcome):
+                if value.cancelled:
+                    self.status.setText(value.message)
+                else:
+                    self.load_repository(value.path)
+                    self.status.setText(value.message)
+            elif isinstance(value, UpdateInfo):
                 self.update_info = value
                 self.update_label.setText(value.summary)
                 self.update_label.setToolTip("\n".join(value.changed_files))
-                self.update_note.setText("После обновления новый тестовый скрипт потребует обновления клиента. Импорт отчётов останется доступен.")
+                self.update_note.setText(value.diagnostic_note or "Автоматические Standard-тесты этой версии пока не поддерживаются.")
                 self.update_note.setVisible(value.available and not value.compatible)
                 self.status.setText("Проверка завершена. " + ("Доступна кнопка обновления." if value.available else "Установлена последняя ревизия main."))
             elif isinstance(value, UpdateOutcome):
                 self.update_info = None
                 self.update_label.setText(f"zapret {self.repo.version} · main обновлена ({value.info.target[:7]})")
-                self.update_note.setText("Новый тестовый скрипт пока не поддерживается. Для результатов используй импорт отчёта service.bat.")
+                self.update_note.setText(value.info.diagnostic_note or "Автоматические Standard-тесты этой версии пока не поддерживаются.")
                 self.update_note.setVisible(not value.info.compatible)
                 self.status.setText(value.message)
                 self.log.appendPlainText(value.message)
@@ -654,6 +751,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def operation_finished(self):
         worker = self.worker
+        finished_kind = self.operation
         if worker:
             # finished can arrive while native thread-local teardown is still
             # running. Join before allowing the window to destroy its children.
@@ -665,6 +763,8 @@ class MainWindow(QMainWindow):
         self.live_results.clear()
         self.test_current = None
         self.test_control = None
+        self.download_control = None
+        self.ui_download_control = None
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         if self.repo:
@@ -678,6 +778,14 @@ class MainWindow(QMainWindow):
             # event surviving into the next operation.
             worker.operation = None
             worker.setParent(None)
+        if finished_kind == "install_ui" and self.ui_update_ready:
+            ready = self.ui_update_ready
+            self.ui_update_ready = None
+            try:
+                launch_install_helper(ready, self.store)
+                self.close_requested = True
+            except Exception as exc:
+                self.show_error(str(exc))
         if self.close_requested:
             QTimer.singleShot(0, self.close)
 
@@ -743,6 +851,12 @@ class MainWindow(QMainWindow):
             self.close_requested = True
             if self.operation == "tests":
                 self.cancel_tests(closing=True)
+            elif self.operation == "download" and self.download_control:
+                self.download_control.set()
+                self.status.setText("Отменяю скачивание и закрываю приложение…")
+            elif self.operation == "install_ui" and self.ui_download_control:
+                self.ui_download_control.set()
+                self.status.setText("Отменяю обновление UI и закрываю приложение…")
             else:
                 self.status.setText("Закрываю приложение после завершения текущей операции…")
             event.ignore()

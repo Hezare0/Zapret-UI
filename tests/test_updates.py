@@ -1,7 +1,6 @@
 from pathlib import Path
 import subprocess
 import sys
-import zipfile
 
 import psutil
 import pytest
@@ -42,7 +41,7 @@ def update_pair(sample_repo, tmp_path, monkeypatch):
     return seed, repo, store
 
 
-def test_check_update_backup_apply_and_up_to_date(update_pair):
+def test_check_update_without_persistent_archive_and_up_to_date(update_pair):
     seed, repo, store = update_pair
     updater = Updater(repo, store)
     original = (repo.root / "general.bat").read_bytes()
@@ -61,13 +60,78 @@ def test_check_update_backup_apply_and_up_to_date(update_pair):
     assert git(repo.root, "rev-parse", "HEAD") == info.target
     assert repo.version == "2.0"
     assert ignored.read_text() == "custom.example.invalid\n"
-    with zipfile.ZipFile(outcome.backup) as archive:
-        assert archive.read("general.bat") == original
-        assert "custom.example.invalid" in archive.read("lists/list-general-user.txt").decode()
-        assert ".git/HEAD" in archive.namelist()
+    assert outcome.preserved_paths == ()
+    assert not (store.folder / "backups").exists()
     assert Store(store.folder).entries(repo.key)["general.bat"]["result"]["targets"]
     assert repo.get("general.bat").fingerprint != old_fingerprint
     assert not updater.check().available
+
+
+@pytest.mark.parametrize("upstream_changes_ipset", [False, True])
+def test_modified_ipset_survives_fast_forward_without_archive(update_pair, upstream_changes_ipset):
+    seed, repo, store = update_pair
+    updater = Updater(repo, store)
+    if upstream_changes_ipset:
+        (seed / "lists/ipset-all.txt").write_text("198.51.100.3/32\n")
+        git(seed, "add", "lists/ipset-all.txt")
+        git(seed, "commit", "-m", "upstream ipset")
+    local_ipset = repo.root / "lists/ipset-all.txt"
+    original = b"\xef\xbb\xbf203.0.113.113/32\r\ncustom-user-range\r\n"
+    local_ipset.write_bytes(original)
+    info = updater.check()
+    outcome = updater.apply(info)
+    assert git(repo.root, "rev-parse", "HEAD") == info.target
+    assert local_ipset.read_bytes() == original
+    assert outcome.preserved_paths == ("lists/ipset-all.txt",)
+    assert not (store.folder / "backups").exists()
+    assert git(repo.root, "status", "--porcelain").splitlines() == ["M lists/ipset-all.txt"]
+    assert not git(repo.root, "stash", "list")
+    if upstream_changes_ipset:
+        assert "Upstream тоже изменил IPSet" in outcome.message
+
+
+def test_unrelated_user_stash_is_not_removed(update_pair):
+    _, repo, store = update_pair
+    # Keep a real prior stash made by the user from another tracked file.
+    (repo.root / "general (ALT).bat").write_text("personal change\n")
+    git(repo.root, "stash", "push", "-m", "pre-existing user stash", "--", "general (ALT).bat")
+    before = git(repo.root, "rev-parse", "refs/stash")
+    (repo.root / "lists/ipset-all.txt").write_bytes(b"user mode\r\n")
+    updater = Updater(repo, store)
+    updater.apply(updater.check())
+    assert git(repo.root, "rev-parse", "refs/stash") == before
+
+
+def test_two_successive_updates_reuse_disabled_hooks_directory(update_pair):
+    seed, repo, store = update_pair
+    updater = Updater(repo, store)
+    updater.apply(updater.check())
+    (seed / "service.bat").write_text('@echo off\nset "LOCAL_VERSION=3.0"\n')
+    git(seed, "add", "service.bat")
+    git(seed, "commit", "-m", "another fixture version")
+    info = updater.check()
+    updater.apply(info)
+    assert repo.version == "3.0"
+    assert git(repo.root, "rev-parse", "HEAD") == info.target
+
+
+def test_failed_merge_restores_ipset_and_leaves_no_archive(update_pair, monkeypatch):
+    _, repo, store = update_pair
+    ipset = repo.root / "lists/ipset-all.txt"
+    ipset.write_bytes(b"user mode\r\n")
+    updater = Updater(repo, store)
+    info = updater.check()
+    original_command = updater.command
+    def fail_merge(*args, **kwargs):
+        if "merge" in args:
+            raise ClientError("simulated merge failure")
+        return original_command(*args, **kwargs)
+    monkeypatch.setattr(updater, "command", fail_merge)
+    with pytest.raises(ClientError, match="Обновление не завершено"):
+        updater.apply(info)
+    assert ipset.read_bytes() == b"user mode\r\n"
+    assert git(repo.root, "rev-parse", "HEAD") == info.current
+    assert not (store.folder / "backups").exists()
 
 
 def test_local_changes_are_preserved_and_block_update(update_pair):

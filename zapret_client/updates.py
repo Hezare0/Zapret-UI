@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import ctypes
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
@@ -15,11 +14,10 @@ import threading
 import tempfile
 import time
 import uuid
-import zipfile
 
 import psutil
 
-from .diagnostics import SUPPORTED_HASHES
+from .diagnostics import script_compatibility
 from .repository import ClientError, Repository
 from .storage import Store
 from .windows import ProcessJob, winws_processes
@@ -48,7 +46,8 @@ def find_git() -> str:
     raise ClientError("Для обновлений нужен Git for Windows. Запуск батников и сохранённые результаты доступны без Git.")
 
 
-def run_external(command: list[str], *, cwd: Path, timeout: float = 60, log_directory: Path | None = None) -> subprocess.CompletedProcess:
+def run_external(command: list[str], *, cwd: Path, timeout: float = 60, log_directory: Path | None = None,
+                 cancel: threading.Event | None = None) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never", "GIT_MERGE_AUTOEDIT": "no"})
     # A frozen Qt application's SetDllDirectory is inherited by children. Git
@@ -72,6 +71,8 @@ def run_external(command: list[str], *, cwd: Path, timeout: float = 60, log_dire
                     kernel.SetDllDirectoryW(str(bundled))
         deadline = time.monotonic() + timeout
         while job.poll() is None:
+            if cancel and cancel.is_set():
+                raise ClientError("Операция отменена. Дочерние процессы остановлены.")
             if time.monotonic() >= deadline:
                 raise ClientError("Git не ответил за отведённое время. Проверь подключение к GitHub и повтори проверку.")
             time.sleep(0.05)
@@ -105,6 +106,7 @@ class UpdateInfo:
     compatible: bool
     changed_files: tuple[str, ...]
     checked_at: str
+    diagnostic_note: str = ""
 
     @property
     def available(self) -> bool:
@@ -120,7 +122,7 @@ class UpdateInfo:
 @dataclass(frozen=True)
 class UpdateOutcome:
     info: UpdateInfo
-    backup: Path
+    preserved_paths: tuple[str, ...]
     message: str
 
 
@@ -170,64 +172,88 @@ class Updater:
         service = self.command("show", f"{target}:service.bat").stdout
         version = re.search(r'LOCAL_VERSION=([^"\r\n]+)', service)
         script = self.command("show", f"{target}:utils/test zapret.ps1", checked=False)
-        normalized = script.stdout.lstrip("\ufeff").replace("\r\n", "\n")
-        compatible = script.returncode == 0 and hashlib.sha256(normalized.encode()).hexdigest() in SUPPORTED_HASHES
+        compatible, diagnostic_note = (script_compatibility(script.stdout.encode("utf-8"))
+                                       if script.returncode == 0 else (False, "В новой версии нет тестового скрипта."))
         changed = tuple(filter(None, self.command("diff", "--name-only", "-z", current, target).stdout.split("\0")))
         return UpdateInfo(str(self.repo.root), current, target, self.repo.version,
                           version[1] if version else target[:7], commits, compatible, changed,
-                          datetime.now().astimezone().isoformat(timespec="seconds"))
+                          datetime.now().astimezone().isoformat(timespec="seconds"), diagnostic_note)
 
-    def ensure_unchanged(self, info: UpdateInfo):
+    def ensure_unchanged(self, info: UpdateInfo) -> tuple[str, ...]:
         self.validate_repository()
         if Path(info.root).resolve() != self.repo.root or not re.fullmatch(r"[0-9a-f]{40,64}", info.target):
             raise ClientError("Результат проверки относится к другому репозиторию.")
         if self.command("rev-parse", "HEAD").stdout.strip() != info.current:
             raise ClientError("Локальная версия изменилась после проверки. Проверь обновления ещё раз.")
-        dirty = self.command("status", "--porcelain", "--untracked-files=all").stdout.strip()
-        if dirty:
-            raise ClientError("Есть локальные изменения. Обновление остановлено, чтобы сохранить их.\n" + dirty[:1800])
+        preserved, blocked = [], []
+        for line in self.command("status", "--porcelain", "--untracked-files=all").stdout.splitlines():
+            if line == " M lists/ipset-all.txt":
+                preserved.append("lists/ipset-all.txt")
+            else:
+                blocked.append(line)
+        if blocked:
+            raise ClientError("Есть другие локальные изменения. Обновление остановлено, чтобы сохранить их.\n" +
+                              "\n".join(blocked)[:1800])
+        return tuple(preserved)
 
-    def snapshot(self, info: UpdateInfo) -> Path:
-        folder = self.store.folder / "backups" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        if folder.resolve().is_relative_to(self.repo.root):
-            raise ClientError("Папка резервных копий не должна находиться внутри обновляемого репозитория.")
-        folder.mkdir(parents=True)
-        archive = folder / "repository.zip"
-        with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as target:
-            for current, dirs, files in os.walk(self.repo.root, followlinks=False):
-                for name in dirs + files:
-                    path = Path(current) / name
-                    if path.is_symlink() or path.is_junction():
-                        raise ClientError("В папке есть ссылки или junction. Автоматическое обновление остановлено.")
-                for name in files:
-                    path = Path(current) / name
-                    target.write(path, path.relative_to(self.repo.root).as_posix())
-        (folder / "manifest.json").write_text(json.dumps({
-            "repository": str(self.repo.root), "before": info.current, "target": info.target,
-            "changed_files": info.changed_files, "archive": str(archive),
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-        return archive
+    def drop_owned_stash(self, revision: str) -> bool:
+        top = self.command("rev-parse", "-q", "--verify", "refs/stash", checked=False)
+        if top.returncode or top.stdout.strip() != revision:
+            return False
+        self.command("stash", "drop", "stash@{0}")
+        return True
 
     def apply(self, info: UpdateInfo, progress=lambda line: None) -> UpdateOutcome:
         if not info.available:
             raise ClientError("Репозиторий уже актуален.")
         assert_update_idle()
-        self.ensure_unchanged(info)
-        progress("Сохраняю резервную копию репозитория и локальных настроек…")
-        backup = self.snapshot(info)
+        preserved = self.ensure_unchanged(info)
         assert_update_idle()
         self.ensure_unchanged(info)
-        hooks = backup.parent / "disabled-hooks"
-        hooks.mkdir()
+        hooks = self.store.folder / "git-logs" / "disabled-hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        original = {name: (self.repo.root / name).read_bytes() for name in preserved}
+        stash_revision = None
+        retained_stash = False
+        if preserved:
+            progress("Временно сохраняю изменённый IPSet в Git stash…")
+            before = self.command("rev-parse", "-q", "--verify", "refs/stash", checked=False).stdout.strip()
+            self.command("-c", "user.name=Zapret Client", "-c", "user.email=zapret-client@users.noreply.github.com",
+                         "stash", "push", "-m", f"zapret-client-update-{info.current[:12]}-{info.target[:12]}",
+                         "--", *preserved)
+            stash_revision = self.command("rev-parse", "refs/stash").stdout.strip()
+            if stash_revision == before or any((self.repo.root / name).read_bytes() == data
+                                               for name, data in original.items()):
+                raise ClientError("Git не сохранил изменённый IPSet. Обновление остановлено; проверь состояние stash.")
         progress(f"Обновляю main до {info.target[:7]}…")
         try:
             self.command("-c", f"core.hooksPath={hooks}", "merge", "--ff-only", "--no-edit", info.target)
             if self.command("rev-parse", "HEAD").stdout.strip() != info.target:
                 raise ClientError("После обновления HEAD не совпадает с выбранной версией.")
+            for name, data in original.items():
+                (self.repo.root / name).write_bytes(data)
+            if any((self.repo.root / name).read_bytes() != data for name, data in original.items()):
+                raise ClientError("Не удалось восстановить исходные байты IPSet.")
+            if stash_revision and not self.drop_owned_stash(stash_revision):
+                progress("IPSet восстановлен, но временный stash остался: он перестал быть верхней записью.")
+                retained_stash = True
             self.repo.refresh()
         except Exception as exc:
-            raise ClientError(f"Обновление не завершено: {exc}\nРезервная копия: {backup}") from exc
-        message = f"zapret обновлён до {self.repo.version} ({info.target[:7]}). Резервная копия: {backup}"
+            if stash_revision and self.command("rev-parse", "HEAD").stdout.strip() == info.current:
+                try:
+                    self.command("stash", "apply", "--index", stash_revision)
+                    if all((self.repo.root / name).read_bytes() == data for name, data in original.items()):
+                        self.drop_owned_stash(stash_revision)
+                except Exception:
+                    pass  # Keep the stash: it contains the user's original data.
+            raise ClientError(f"Обновление не завершено: {exc}\nПроверь IPSet и временный stash в .git.") from exc
+        message = f"zapret обновлён до {self.repo.version} ({info.target[:7]})."
+        if preserved:
+            message += " Локальный IPSet сохранён."
+            if "lists/ipset-all.txt" in info.changed_files:
+                message += " Upstream тоже изменил IPSet; текущий пользовательский режим оставлен."
+        if retained_stash:
+            message += " Временный Git stash остался из-за параллельной операции Git; проверь его вручную."
         if not info.compatible:
-            message += " Новый тестовый скрипт пока не поддерживается; доступен импорт отчёта."
-        return UpdateOutcome(info, backup, message)
+            message += " " + info.diagnostic_note
+        return UpdateOutcome(info, preserved, message)

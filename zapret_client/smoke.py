@@ -15,6 +15,20 @@ from .windows import is_admin
 from .updates import find_git, run_external
 
 
+def run_update_check_smoke(report: Path) -> int:
+    """Read-only release check from the frozen runtime and bundled MinGit."""
+    from .self_update import check_ui_update
+    report.parent.mkdir(parents=True, exist_ok=True)
+    info = check_ui_update()
+    report.write_text(json.dumps({
+        "ok": True, "frozen": bool(getattr(sys, "frozen", False)),
+        "version": __version__, "published_version": info.available,
+        "asset_size": info.asset_size, "verified_digest_present": bool(info.asset_digest),
+        "git_executable": find_git(), "network_tests_run": False,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0
+
+
 def run_smoke(app, repo: Path | None, report: Path) -> int:
     report.parent.mkdir(parents=True, exist_ok=True)
     window = MainWindow(Store(report.parent / "smoke-state"), repo)

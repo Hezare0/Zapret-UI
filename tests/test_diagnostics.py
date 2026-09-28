@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from zapret_client.diagnostics import JOB_GUARD, adapt_script
+from zapret_client.diagnostics import JOB_GUARD, adapt_script, script_compatibility
 from zapret_client.repository import ClientError
 from zapret_client.windows import ProcessJob, powershell_path
 
@@ -14,8 +14,39 @@ UPSTREAM = Path(os.environ.get("ZAPRET_TEST_UPSTREAM", str(Path(__file__).resolv
 
 
 def test_unknown_version_is_rejected():
-    with pytest.raises(ClientError, match="не поддерживается"):
+    with pytest.raises(ClientError, match="Read-TestType"):
         adapt_script(b"Write-Host 'different source'")
+
+
+@pytest.mark.skipif(not UPSTREAM.exists(), reason="Local upstream checkout not present")
+def test_adapter_accepts_old_current_and_harmless_future_edit(tmp_path):
+    import subprocess
+    original = UPSTREAM.read_bytes()
+    current = adapt_script(original)
+    assert script_compatibility(original)[0]
+    changed = original + b"\n# A harmless change in a later upstream revision\n"
+    assert script_compatibility(changed)[0]
+    root = UPSTREAM.parents[1]
+    old = subprocess.run(["git", "show", "6cec828910d0809863205702182a3557d9d0e8c3:utils/test zapret.ps1"],
+                         cwd=root, capture_output=True, timeout=20)
+    if old.returncode:
+        pytest.skip("Earlier upstream commit is not present in this checkout")
+    previous = adapt_script(old.stdout)
+    for title, script in (("old", previous), ("current", current)):
+        assert "[void][System.Console]::ReadKey($true)" not in script
+        path = tmp_path / f"{title}.ps1"
+        path.write_text(script, encoding="utf-8-sig")
+        check = subprocess.run([str(powershell_path()), "-NoProfile", "-Command",
+                                f'$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("{path}",[ref]$t,[ref]$e); if($e.Count) {{ exit 1 }}'],
+                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=20)
+        assert check.returncode == 0, check.stdout + check.stderr
+
+
+@pytest.mark.skipif(not UPSTREAM.exists(), reason="Local upstream checkout not present")
+def test_new_unconfined_process_stop_is_rejected():
+    changed = UPSTREAM.read_bytes() + b"\ntaskkill /IM winws.exe /F\n"
+    supported, reason = script_compatibility(changed)
+    assert not supported and "новый способ остановки" in reason
 
 
 @pytest.mark.skipif(not UPSTREAM.exists(), reason="Local upstream checkout not present")

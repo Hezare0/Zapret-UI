@@ -14,10 +14,13 @@ def main():
                         help="Check packaged GUI startup and exit; never run BAT files")
     parser.add_argument("--smoke-cancel", type=Path, metavar="REPORT_JSON",
                         help="Check cancel/close with a harmless sleep process; requires --repo")
+    parser.add_argument("--smoke-update-check", type=Path, metavar="REPORT_JSON",
+                        help="Check private GitHub Release access from the packaged runtime")
+    parser.add_argument("--post-update-marker", type=Path, help="Internal startup confirmation for the updater")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This client requires Windows 10/11")
-    report = args.smoke_test or args.smoke_cancel
+    report = args.smoke_test or args.smoke_cancel or args.smoke_update_check
     if report:
         try:
             return run(args)
@@ -44,6 +47,9 @@ def run(args):
     if args.smoke_cancel:
         from zapret_client.smoke import run_cancel_smoke
         return run_cancel_smoke(app, args.repo, args.smoke_cancel)
+    if args.smoke_update_check:
+        from zapret_client.smoke import run_update_check_smoke
+        return run_update_check_smoke(args.smoke_update_check)
     if args.admin and not is_admin():
         try:
             elevate(sys.argv[1:])
@@ -67,6 +73,13 @@ def run(args):
                     break
         window = MainWindow(store, repo)
         window.show()
+        if args.post_update_marker:
+            from PySide6.QtCore import QTimer
+            def confirm_start():
+                if window.isVisible() and window.winId():
+                    args.post_update_marker.parent.mkdir(parents=True, exist_ok=True)
+                    args.post_update_marker.write_text("ready", encoding="ascii")
+            QTimer.singleShot(700, confirm_start)
         return app.exec()
     finally:
         guard.close()

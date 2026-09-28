@@ -57,7 +57,7 @@ def test_unknown_adapter_does_not_stop_active_config(sample_repo, tmp_path, monk
     controller = Controller(Store(tmp_path / "state"))
     called = []
     monkeypatch.setattr(controller, "stop", lambda: called.append("stop"))
-    with pytest.raises(ClientError, match="не поддерживается"):
+    with pytest.raises(ClientError, match="Read-TestType"):
         controller.run_tests(repo, lambda *args: None)
     assert called == []
 
