@@ -54,7 +54,7 @@ def test_check_update_without_persistent_archive_and_up_to_date(update_pair):
     info = updater.check()
     assert info.available and info.commits == 1 and info.remote_version == "2.0"
     assert "general.bat" in info.changed_files
-    assert not info.compatible
+    assert info.compatible
     assert (repo.root / "general.bat").read_bytes() == original  # Check does not apply.
     outcome = updater.apply(info)
     assert git(repo.root, "rev-parse", "HEAD") == info.target

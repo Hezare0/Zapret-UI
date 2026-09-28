@@ -16,11 +16,13 @@ def main():
                         help="Check cancel/close with a harmless sleep process; requires --repo")
     parser.add_argument("--smoke-update-check", type=Path, metavar="REPORT_JSON",
                         help="Check private GitHub Release access from the packaged runtime")
+    parser.add_argument("--smoke-probes", type=Path, metavar="REPORT_JSON",
+                        help="Check packaged curl/ping probes on loopback without running BAT files")
     parser.add_argument("--post-update-marker", type=Path, help="Internal startup confirmation for the updater")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This client requires Windows 10/11")
-    report = args.smoke_test or args.smoke_cancel or args.smoke_update_check
+    report = args.smoke_test or args.smoke_cancel or args.smoke_update_check or args.smoke_probes
     if report:
         try:
             return run(args)
@@ -50,6 +52,9 @@ def run(args):
     if args.smoke_update_check:
         from zapret_client.smoke import run_update_check_smoke
         return run_update_check_smoke(args.smoke_update_check)
+    if args.smoke_probes:
+        from zapret_client.smoke import run_probe_smoke
+        return run_probe_smoke(args.smoke_probes)
     if args.admin and not is_admin():
         try:
             elevate(sys.argv[1:])

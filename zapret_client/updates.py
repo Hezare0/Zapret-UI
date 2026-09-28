@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from datetime import datetime
 import ctypes
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -17,7 +16,6 @@ import uuid
 
 import psutil
 
-from .diagnostics import script_compatibility
 from .repository import ClientError, Repository
 from .storage import Store
 from .windows import ProcessJob, winws_processes
@@ -171,9 +169,7 @@ class Updater:
         commits = int(self.command("rev-list", "--count", f"{current}..{target}").stdout.strip())
         service = self.command("show", f"{target}:service.bat").stdout
         version = re.search(r'LOCAL_VERSION=([^"\r\n]+)', service)
-        script = self.command("show", f"{target}:utils/test zapret.ps1", checked=False)
-        compatible, diagnostic_note = (script_compatibility(script.stdout.encode("utf-8"))
-                                       if script.returncode == 0 else (False, "В новой версии нет тестового скрипта."))
+        compatible, diagnostic_note = True, "Standard-тесты выполняются кодом клиента."
         changed = tuple(filter(None, self.command("diff", "--name-only", "-z", current, target).stdout.split("\0")))
         return UpdateInfo(str(self.repo.root), current, target, self.repo.version,
                           version[1] if version else target[:7], commits, compatible, changed,

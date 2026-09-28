@@ -110,13 +110,13 @@ def test_cancelled_extraction_cleans_staging(monkeypatch, tmp_path):
 
 
 def test_release_check_selects_verified_asset(monkeypatch):
-    release = {"tag_name": "v0.4.0", "html_url": "https://github.com/Hezare0/Zapret-UI/releases/tag/v0.4.0",
-               "assets": [{"id": 123, "name": "ZapretClient-v0.4.0-windows-x64.zip", "state": "uploaded",
+    release = {"tag_name": "v0.5.0", "html_url": "https://github.com/Hezare0/Zapret-UI/releases/tag/v0.5.0",
+               "assets": [{"id": 123, "name": "ZapretClient-v0.5.0-windows-x64.zip", "state": "uploaded",
                            "size": 512, "digest": "sha256:" + "a" * 64}]}
     monkeypatch.setattr(updater, "_github_token", lambda: "")
     monkeypatch.setattr(updater, "_request", lambda url, token: release)
     info = updater.check_ui_update()
-    assert info.available == "0.4.0" and info.has_update
+    assert info.available == "0.5.0" and info.has_update
     assert info.asset_url.endswith("/123")
     assert info.asset_digest == "a" * 64
 

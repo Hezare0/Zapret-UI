@@ -34,6 +34,14 @@ def test_spaces_are_allowed():
     validate_shell_path(Path("C:/some folder/general (ALT3).bat"))
 
 
+def test_upstream_test_script_no_longer_invalidates_own_diagnostics(sample_repo):
+    repo = Repository(sample_repo)
+    before = {config.name: config.fingerprint for config in repo.configs}
+    repo.test_script.write_text("Upstream changed its test script", encoding="utf-8")
+    repo.refresh()
+    assert {config.name: config.fingerprint for config in repo.configs} == before
+
+
 def test_cache_roundtrip_and_repository_isolation(tmp_path):
     store = Store(tmp_path)
     result = ReportParser.parse("[1/1] general.bat\nDNS Ping: 12 ms").results["general.bat"]

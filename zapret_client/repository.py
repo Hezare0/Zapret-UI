@@ -58,7 +58,7 @@ class Repository:
         if not paths:
             raise ClientError("В этой папке нет general*.bat.")
         shared = hashlib.sha256()
-        inputs = [self.service, self.test_script]
+        inputs = [self.service]
         for folder in ("lists", "bin", "utils"):
             base = self.root / folder
             if base.exists():

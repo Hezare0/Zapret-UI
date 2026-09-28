@@ -1,38 +1,40 @@
-from pathlib import Path
-import textwrap
 import time
 
 import pytest
 
 import zapret_client.controller as runtime
 from zapret_client.controller import Controller, TestControl
+from zapret_client.probe_engine import ProbeCancelled
 from zapret_client.repository import ClientError, Repository
 from zapret_client.storage import Store
-from zapret_client.results import ReportParser
+from zapret_client.results import ReportParser, Target
 
 
-@pytest.mark.parametrize("exit_code", [0, 9])
-def test_diagnostics_streams_and_restores_exact_ipset(sample_repo, tmp_path, monkeypatch, exit_code):
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_own_diagnostics_checkpoints_and_restores_exact_ipset(sample_repo, tmp_path, monkeypatch, interrupt):
     repo = Repository(sample_repo)
     store = Store(tmp_path / "state")
     before = (sample_repo / "lists/ipset-all.txt").read_bytes()
     monkeypatch.setattr(runtime, "check_conflicts", lambda *args: None)
-
-    def fixture_script(source, folder):
-        script = folder / "fixture.ps1"
-        lines = ["[INFO] Targets loaded: 1"]
-        for i, config in enumerate(repo.configs, 1):
-            lines.extend([f"[{i}/{len(repo.configs)}] {config.name}", "Running tests...", "DNS Ping: 12 ms"])
-        if exit_code == 0:
-            lines.extend(["All tests finished.", "Results saved to fixture.txt"])
-        body = '\n'.join("Write-Output '" + line + "'" for line in lines)
-        script.write_text("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n" + body +
-                          "\n[IO.File]::WriteAllText((Join-Path $env:ZAPRET_CLIENT_ROOT 'lists/ipset-all.txt'), 'changed by fixture')\n" +
-                          f"exit {exit_code}\n", encoding="utf-8-sig")
-        return script
-
-    monkeypatch.setattr(runtime, "prepare_script", fixture_script)
+    monkeypatch.setattr(runtime, "load_targets", lambda *_: [object()])
+    monkeypatch.setattr(runtime, "system_tool", lambda name: name)
     controller = Controller(store)
+    def start(repo, name, *, cancel=None, stable_for=1.0):
+        controller.active_name, controller.active_repo = name, repo
+        return name
+    def stop():
+        controller.active_name = controller.active_repo = None
+    monkeypatch.setattr(controller, "start", start)
+    monkeypatch.setattr(controller, "stop", stop)
+    monkeypatch.setattr(controller, "running", lambda: bool(controller.active_name))
+    checked = []
+    def probes(targets, curl, ping, cancel, on_target, **kwargs):
+        checked.append(controller.active_name)
+        if interrupt and len(checked) == 2:
+            raise RuntimeError("simulated probe failure")
+        (sample_repo / "lists/ipset-all.txt").write_bytes(b"changed by fixture")
+        on_target(Target("DNS", {}, 12.0, "12 ms"))
+    monkeypatch.setattr(runtime, "run_probes", probes)
     observed = []
     checkpoints = []
     def progress(line, parser):
@@ -41,23 +43,23 @@ def test_diagnostics_streams_and_restores_exact_ipset(sample_repo, tmp_path, mon
             checkpoints.append(len(Store(store.folder).entries(repo.key)))
     outcome = controller.run_tests(repo, progress)
     assert (sample_repo / "lists/ipset-all.txt").read_bytes() == before
-    assert outcome.successful is (exit_code == 0)
-    assert len(outcome.parser.results) == len(repo.configs)
-    assert any("DNS Ping: 12 ms" in line for line in observed)
+    assert outcome.successful is (not interrupt)
+    assert len(outcome.parser.results) == (2 if interrupt else len(repo.configs))
+    assert any("DNS" in line and "Ping: 12 ms" in line for line in observed)
     assert outcome.log.is_file()
     assert (outcome.log.parent / "ipset-all.before.txt").read_bytes() == before
     assert controller.active_name is None
     assert checkpoints and checkpoints[0] == 1
 
 
-def test_unknown_adapter_does_not_stop_active_config(sample_repo, tmp_path, monkeypatch):
+def test_invalid_targets_do_not_stop_active_config(sample_repo, tmp_path, monkeypatch):
     repo = Repository(sample_repo)
-    (repo.test_script).write_text("Write-Host 'unknown'")
+    (sample_repo / "utils/targets.txt").write_text('Broken = "file:///private"\n')
     monkeypatch.setattr(runtime, "check_conflicts", lambda *args: None)
     controller = Controller(Store(tmp_path / "state"))
     called = []
     monkeypatch.setattr(controller, "stop", lambda: called.append("stop"))
-    with pytest.raises(ClientError, match="Read-TestType"):
+    with pytest.raises(ClientError, match="URL"):
         controller.run_tests(repo, lambda *args: None)
     assert called == []
 
@@ -84,34 +86,36 @@ def test_cancel_sweep_restores_ipset_and_preserves_completed_and_old_results(sam
     control = TestControl()
     monkeypatch.setattr(runtime, "check_conflicts", lambda *args: None)
     before = (sample_repo / "lists/ipset-all.txt").read_bytes()
+    monkeypatch.setattr(runtime, "load_targets", lambda *_: [object()])
+    monkeypatch.setattr(runtime, "system_tool", lambda name: name)
     first, second = repo.configs[:2]
     old = ReportParser.parse(f"[1/1] {second.name}\nDNS Ping: 99 ms").results[second.name.casefold()]
     store.put(repo.key, old, second.fingerprint, "live", tested_at="2026-09-10T10:00:00+05:00")
     store.save()
 
-    def fixture_script(source, folder):
-        script = folder / "cancel.ps1"
-        script.write_text(
-            "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n"
-            "[IO.File]::WriteAllText((Join-Path $env:ZAPRET_CLIENT_ROOT 'lists/ipset-all.txt'), 'changed')\n"
-            "Write-Output '[INFO] Targets loaded: 1'\n"
-            f"Write-Output '[1/4] {first.name}'\nWrite-Output 'DNS Ping: 12 ms'\n"
-            f"Write-Output '[2/4] {second.name}'\nWrite-Output 'WAIT_FOR_CANCEL'\nStart-Sleep -Seconds 60\n",
-            encoding="utf-8-sig")
-        return script
-
-    monkeypatch.setattr(runtime, "prepare_script", fixture_script)
     controller = Controller(store)
     controller.active_name, controller.active_repo = "general.bat", repo
     restored = []
-    def restore(repo, name, *, cancel=None):
-        restored.append(name)
+    def restore(repo, name, *, cancel=None, stable_for=1.0):
+        if name == "general.bat":
+            restored.append(name)
         controller.active_name, controller.active_repo = name, repo
         return name
     monkeypatch.setattr(controller, "start", restore)
-    def progress(line, parser):
-        if "WAIT_FOR_CANCEL" in line:
+    def stop():
+        controller.active_name = controller.active_repo = None
+    monkeypatch.setattr(controller, "stop", stop)
+    monkeypatch.setattr(controller, "running", lambda: bool(controller.active_name))
+    def probes(targets, curl, ping, cancel, on_target, **kwargs):
+        if controller.active_name == first.name:
+            (sample_repo / "lists/ipset-all.txt").write_bytes(b"changed")
+            on_target(Target("DNS", {}, 12.0, "12 ms"))
+        else:
             control.request(closing=closing)
+            raise ProbeCancelled()
+    monkeypatch.setattr(runtime, "run_probes", probes)
+    def progress(line, parser):
+        pass
     started = time.monotonic()
     outcome = controller.run_tests(repo, progress, control)
     assert time.monotonic() - started < 10
@@ -132,13 +136,10 @@ def test_cancel_before_launch_never_starts_test_process(sample_repo, tmp_path, m
     control = TestControl()
     control.request(closing=True)
     monkeypatch.setattr(runtime, "check_conflicts", lambda *args: None)
-    script = tmp_path / "must-not-run.ps1"
-    script.write_text("throw 'Must not run'")
-    monkeypatch.setattr(runtime, "prepare_script", lambda *args: script)
-    def unexpected_job():
-        pytest.fail("A cancelled operation must not create a process")
-    monkeypatch.setattr(runtime, "ProcessJob", unexpected_job)
+    monkeypatch.setattr(runtime, "system_tool", lambda name: name)
     controller = Controller(Store(tmp_path / "state"))
+    monkeypatch.setattr(controller, "start", lambda *a, **kw: pytest.fail("Cancelled sweep started a config"))
+    monkeypatch.setattr(controller, "stop", lambda: pytest.fail("Cancelled sweep stopped an active config"))
     outcome = controller.run_tests(repo, lambda *args: None, control)
     assert outcome.cancelled and outcome.cleanup_ok
     assert not outcome.parser.results

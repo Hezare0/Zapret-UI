@@ -1,6 +1,5 @@
 """Blocking runtime operations; the GUI runs these in a worker thread."""
 
-import codecs
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -8,11 +7,11 @@ import time
 import threading
 from typing import Callable
 
-from .diagnostics import prepare_script
+from .probe_engine import ProbeCancelled, format_target, load_targets, probe_parallelism, run_probes, system_tool
 from .repository import ClientError, Repository
 from .results import ReportParser
 from .storage import Store
-from .windows import ProcessJob, batch_command, check_conflicts, powershell_path, winws_processes
+from .windows import ProcessJob, batch_command, check_conflicts, winws_processes
 
 
 class OperationCancelled(ClientError):
@@ -77,7 +76,8 @@ class Controller:
         self.active_name = None
         self.active_repo = None
 
-    def start(self, repo: Repository, name: str, *, cancel: threading.Event | None = None) -> str:
+    def start(self, repo: Repository, name: str, *, cancel: threading.Event | None = None,
+              stable_for: float = 1.0) -> str:
         if cancel and cancel.is_set():
             raise OperationCancelled("Запуск отменён.")
         repo.refresh()
@@ -103,7 +103,7 @@ class Controller:
                            if p["pid"] in pids and Path(p["exe"]).resolve() == repo.executable.resolve()]
                 if matches:
                     stable_since = stable_since or time.monotonic()
-                    if time.monotonic() - stable_since >= 1:
+                    if time.monotonic() - stable_since >= stable_for:
                         self.job, self.active_name, self.active_repo = job, name, repo
                         return name
                 else:
@@ -123,6 +123,10 @@ class Controller:
         repo.refresh()
         repo.validate_run()
         check_conflicts(self.owned_pids())
+        targets = load_targets(repo.root / "utils" / "targets.txt")
+        curl = system_tool("curl.exe")
+        ping = system_tool("ping.exe")
+        parallelism = probe_parallelism()
         ipset = repo.root / "lists" / "ipset-all.txt"
         if not ipset.is_file():
             raise ClientError("Не найден lists\\ipset-all.txt. Автоматические тесты требуют полного комплекта файлов.")
@@ -130,7 +134,6 @@ class Controller:
             raise ClientError("Обнаружен ipset_switched.flag от незавершённого upstream-теста. "
                               "Сначала восстановите ipset штатным service.bat → Run Tests.")
         folder = self.store.new_run_folder()
-        script = prepare_script(repo.test_script, folder)
         original_ipset = ipset.read_bytes()
         (folder / "ipset-all.before.txt").write_bytes(original_ipset)
         previous = self.active_name if self.active_repo and self.active_repo.root == repo.root else None
@@ -142,100 +145,88 @@ class Controller:
         log = folder / "diagnostics.log"
         parser = ReportParser()
         failures = []
-        job = None
-        code = None
         stopped = False
         cancelled = False
         cleanup_ok = True
+        stream = log.open("w", encoding="utf-8", newline="\n")
+
+        def emit(line: str) -> None:
+            stream.write(line + "\n")
+            stream.flush()
+            parser.feed(line)
+            on_line(line, parser)
+
         try:
             if control.cancel.is_set():
-                cancelled = True
                 raise OperationCancelled("Проверка отменена до запуска.")
             self.stop()
             stopped = True
             check_conflicts()
-            job = ProcessJob()
-            self.test_job = job
-            job.start([str(powershell_path()), "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                       "-File", str(script)], repo.root, log,
-                      {"ZAPRET_CLIENT_ROOT": str(repo.root), "ZAPRET_CLIENT_JOB": job.name,
-                       "NO_UPDATE_CHECK": "1"})
-            decoder = codecs.getincrementaldecoder("utf-8")("replace")
-            pending = ""
-            checkpointed = set()
-
-            def emit(line):
-                parser.feed(line)
-                if "Running tests..." in line and parser.current:
-                    repo.refresh()
-                    fingerprints[parser.current.config.casefold()] = repo.get(parser.current.config).fingerprint
-                # Commit each completed configuration before waiting for the
-                # remaining sweep. A later crash must not discard its results.
-                for key, result in parser.results.items():
-                    if result.complete and key not in checkpointed and key in fingerprints:
-                        self.store.put(repo.key, result, fingerprints[key], "checkpoint", str(log))
-                        self.store.save()
-                        checkpointed.add(key)
-                on_line(line, parser)
-
-            with log.open("rb") as stream:
-                while True:
-                    if control.cancel.is_set() and not cancelled:
-                        cancelled = True
-                        on_line("[CLIENT] Останавливаю тестовые процессы и сохраняю полученные результаты…", parser)
-                        job.stop()
-                        self.test_job = None
-                    chunk = stream.read(65536)
-                    if chunk:
-                        pending += decoder.decode(chunk)
-                        lines = pending.split("\n")
-                        pending = lines.pop()
-                        for line in lines:
-                            emit(line.rstrip("\r"))
-                    elif cancelled or job.poll() is not None:
-                        # Root exited: no further host output is expected.
-                        pending += decoder.decode(b"", final=True)
-                        if pending:
-                            emit(pending)
-                        code = -1 if cancelled else job.poll()
-                        break
-                    else:
-                        time.sleep(0.1)
-            parser.finish()
-        except OperationCancelled:
+            emit(f"[INFO] Targets loaded: {len(targets)}")
+            emit(f"[INFO] Parallel probes: {parallelism}")
+            for index, config in enumerate(repo.configs, 1):
+                if control.cancel.is_set():
+                    raise OperationCancelled("Проверка отменена.")
+                emit(f"[{index}/{len(repo.configs)}] {config.name}")
+                emit("Starting config...")
+                try:
+                    self.start(repo, config.name, cancel=control.cancel, stable_for=0.3)
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    emit(f"[ERROR] Strategy failed to start: {exc}")
+                    self.stop()
+                    continue
+                repo.refresh()
+                fingerprints[config.name.casefold()] = repo.get(config.name).fingerprint
+                emit("Running tests...")
+                run_probes(targets, curl, ping, control.cancel,
+                           lambda result: emit(format_target(result)), max_workers=parallelism)
+                if not self.running():
+                    emit("[ERROR] winws завершился во время тестов; результат конфигурации недействителен.")
+                    parser.current.launch_failed = True
+                self.stop()
+                result = parser.results[config.name.casefold()]
+                result.complete = True
+                self.store.put(repo.key, result, fingerprints[config.name.casefold()], "checkpoint", str(log))
+                self.store.save()
+            emit("All tests finished.")
+            emit(f"Results saved to {log}")
+        except (OperationCancelled, ProbeCancelled):
             cancelled = True
         except Exception as exc:
             failures.append(str(exc))
+            emit(f"[ERROR] Диагностика прервана: {exc}")
         finally:
-            if job:
+            if stopped:
                 try:
-                    job.stop()
-                    self.test_job = None
+                    self.stop()
                 except Exception as exc:
                     cleanup_ok = False
                     failures.append(f"Остановка тестовых процессов: {exc}")
-            # Exact bytes are an extra recovery layer on top of upstream finally.
+            # The batches can touch ipset; restore the exact pre-test contents.
             try:
                 if not ipset.exists() or ipset.read_bytes() != original_ipset:
                     ipset.write_bytes(original_ipset)
-                    on_line("[CLIENT] Исходное содержимое ipset восстановлено из слепка.", parser)
+                    emit("[CLIENT] Исходное содержимое ipset восстановлено из слепка.")
             except OSError as exc:
                 cleanup_ok = False
                 failures.append(f"Не удалось восстановить ipset. Слепок: {folder}: {exc}")
             if previous and stopped and not control.closing.is_set() and cleanup_ok:
                 try:
                     self.start(repo, previous, cancel=control.closing)
-                    on_line(f"[CLIENT] Снова включён {previous}.", parser)
+                    emit(f"[CLIENT] Снова включён {previous}.")
                 except OperationCancelled:
                     pass
                 except Exception as exc:
                     failures.append(f"Не удалось снова включить {previous}: {exc}")
+            stream.close()
         expected_names = {c.name.casefold() for c in repo.configs}
         measured = set(parser.results)
-        successful = (code == 0 and parser.finished and parser.saved and not parser.has_errors
+        successful = (parser.finished and parser.saved and not parser.has_errors
                       and measured == expected_names and not failures and not cancelled)
         message = "Диагностика завершена. Результаты сохранены." if successful else (
-            "Диагностика завершилась не полностью. " + " ".join(failures or [f"Код процесса: {code}. См. журнал."]))
+            "Диагностика завершилась не полностью. " + " ".join(failures or ["См. журнал."]))
         if cancelled:
             completed = sum(result.complete for result in parser.results.values())
             message = f"Проверка остановлена. Завершённых конфигураций: {completed}. Полученные результаты сохранены."

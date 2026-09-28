@@ -29,6 +29,41 @@ def run_update_check_smoke(report: Path) -> int:
     return 0
 
 
+def run_probe_smoke(report: Path) -> int:
+    """Exercise actual bundled Python orchestration and Windows probes locally."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from .probe_engine import ProbeTarget, run_probes, system_tool
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(403)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        targets = [ProbeTarget("LocalWeb", f"http://127.0.0.1:{server.server_port}", "127.0.0.1"),
+                   ProbeTarget("LocalPing", None, "127.0.0.1")]
+        results = run_probes(targets, system_tool("curl.exe"), system_tool("ping.exe"),
+                             threading.Event(), lambda _: None, max_workers=8)
+        ok = all(item.ok and item.ping_ms is not None for item in results)
+        report.write_text(json.dumps({"ok": ok, "frozen": bool(getattr(sys, "frozen", False)),
+                                      "version": __version__, "targets": [item.name for item in results],
+                                      "protocols": results[0].protocols, "ping_ms": results[1].ping_ms,
+                                      "external_network_tests_run": False}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 0 if ok else 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def run_smoke(app, repo: Path | None, report: Path) -> int:
     report.parent.mkdir(parents=True, exist_ok=True)
     window = MainWindow(Store(report.parent / "smoke-state"), repo)
